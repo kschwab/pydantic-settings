@@ -40,11 +40,50 @@ from typing_extensions import Annotated, get_args, get_origin
 from pydantic_settings.utils import path_type_label
 
 if TYPE_CHECKING:
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        tomllib = None
+    import tomli
+    import yaml
+
     from pydantic_settings.main import BaseSettings
+else:
+    yaml = None
+    tomllib = None
+    tomli = None
+
+
+def import_yaml() -> None:
+    global yaml
+    if yaml is not None:
+        return
+    try:
+        import yaml
+    except ImportError as e:
+        raise ImportError('PyYAML is not installed, run `pip install pydantic-settings[yaml]`') from e
+
+
+def import_toml() -> None:
+    global tomli
+    global tomllib
+    if sys.version_info < (3, 11):
+        if tomli is not None:
+            return
+        try:
+            import tomli
+        except ImportError as e:
+            raise ImportError('tomli is not installed, run `pip install pydantic-settings[toml]`') from e
+    else:
+        if tomllib is not None:
+            return
+        import tomllib
 
 from argparse import SUPPRESS, ArgumentParser, HelpFormatter, Namespace, _SubParsersAction
 
 DotenvType = Union[Path, str, List[Union[Path, str]], Tuple[Union[Path, str], ...]]
+PathType = Union[Path, str, List[Union[Path, str]], Tuple[Union[Path, str], ...]]
+DEFAULT_PATH: PathType = Path('')
 
 # This is used as default value for `_env_file` in the `BaseSettings` class and
 # `env_file` in `DotEnvSettingsSource` so the default can be distinguished from `None`.
@@ -160,7 +199,7 @@ class InitSettingsSource(PydanticBaseSettingsSource):
         return None, '', False
 
     def __call__(self) -> dict[str, Any]:
-        return TypeAdapter(Dict[str, Any]).dump_python(self.init_kwargs)
+        return self.init_kwargs
 
     def __repr__(self) -> str:
         return f'InitSettingsSource(init_kwargs={self.init_kwargs!r})'
@@ -682,28 +721,26 @@ class DotEnvSettingsSource(EnvSettingsSource):
 
     def __call__(self) -> dict[str, Any]:
         data: dict[str, Any] = super().__call__()
-
-        data_lower_keys: list[str] = []
         is_extra_allowed = self.config.get('extra') != 'forbid'
-        if not self.case_sensitive:
-            data_lower_keys = [x.lower() for x in data.keys()]
+
         # As `extra` config is allowed in dotenv settings source, We have to
-        # update data with extra env variabels from dotenv file.
+        # update data with extra env variables from dotenv file.
         for env_name, env_value in self.env_vars.items():
-            if not is_extra_allowed and not env_name.startswith(self.env_prefix):
-                raise SettingsError(
-                    "unable to load environment variables from dotenv file "
-                    f"due to the presence of variables without the specified prefix - '{self.env_prefix}'"
-                )
-            if env_name.startswith(self.env_prefix) and env_value is not None:
-                env_name_without_prefix = env_name[self.env_prefix_len :]
-                first_key, *_ = env_name_without_prefix.split(self.env_nested_delimiter)
-
-                if (data_lower_keys and first_key not in data_lower_keys) or (
-                    not data_lower_keys and first_key not in data
-                ):
-                    data[first_key] = env_value
-
+            if not env_value:
+                continue
+            env_used = False
+            for field_name, field in self.settings_cls.model_fields.items():
+                for _, field_env_name, _ in self._extract_field_info(field, field_name):
+                    if env_name.startswith(field_env_name):
+                        env_used = True
+                        break
+            if not env_used:
+                if is_extra_allowed and env_name.startswith(self.env_prefix):
+                    # env_prefix should be respected and removed from the env_name
+                    normalized_env_name = env_name[len(self.env_prefix) :]
+                    data[normalized_env_name] = env_value
+                else:
+                    data[env_name] = env_value
         return data
 
     def __repr__(self) -> str:
@@ -1248,6 +1285,97 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
 
     def _metavar_format(self, obj: Any) -> str:
         return self._metavar_format_recurse(obj).replace(', ', ',')
+
+
+class ConfigFileSourceMixin(ABC):
+    def _read_files(self, files: PathType | None) -> dict[str, Any]:
+        if files is None:
+            return {}
+        if isinstance(files, (str, os.PathLike)):
+            files = [files]
+        vars: dict[str, Any] = {}
+        for file in files:
+            file_path = Path(file).expanduser()
+            if file_path.is_file():
+                vars.update(self._read_file(file_path))
+        return vars
+
+    @abstractmethod
+    def _read_file(self, path: Path) -> dict[str, Any]:
+        pass
+
+
+class JsonConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
+    """
+    A source class that loads variables from a JSON file
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        json_file: PathType | None = DEFAULT_PATH,
+        json_file_encoding: str | None = None,
+    ):
+        self.json_file_path = json_file if json_file != DEFAULT_PATH else settings_cls.model_config.get('json_file')
+        self.json_file_encoding = (
+            json_file_encoding
+            if json_file_encoding is not None
+            else settings_cls.model_config.get('json_file_encoding')
+        )
+        self.json_data = self._read_files(self.json_file_path)
+        super().__init__(settings_cls, self.json_data)
+
+    def _read_file(self, file_path: Path) -> dict[str, Any]:
+        with open(file_path, encoding=self.json_file_encoding) as json_file:
+            return json.load(json_file)
+
+
+class TomlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
+    """
+    A source class that loads variables from a JSON file
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        toml_file: PathType | None = DEFAULT_PATH,
+    ):
+        self.toml_file_path = toml_file if toml_file != DEFAULT_PATH else settings_cls.model_config.get('toml_file')
+        self.toml_data = self._read_files(self.toml_file_path)
+        super().__init__(settings_cls, self.toml_data)
+
+    def _read_file(self, file_path: Path) -> dict[str, Any]:
+        import_toml()
+        with open(file_path, mode='rb') as toml_file:
+            if sys.version_info < (3, 11):
+                return tomli.load(toml_file)
+            return tomllib.load(toml_file)
+
+
+class YamlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
+    """
+    A source class that loads variables from a yaml file
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        yaml_file: PathType | None = DEFAULT_PATH,
+        yaml_file_encoding: str | None = None,
+    ):
+        self.yaml_file_path = yaml_file if yaml_file != DEFAULT_PATH else settings_cls.model_config.get('yaml_file')
+        self.yaml_file_encoding = (
+            yaml_file_encoding
+            if yaml_file_encoding is not None
+            else settings_cls.model_config.get('yaml_file_encoding')
+        )
+        self.yaml_data = self._read_files(self.yaml_file_path)
+        super().__init__(settings_cls, self.yaml_data)
+
+    def _read_file(self, file_path: Path) -> dict[str, Any]:
+        import_yaml()
+        with open(file_path, encoding=self.yaml_file_encoding) as yaml_file:
+            return yaml.safe_load(yaml_file)
 
 
 def _get_env_var_key(key: str, case_sensitive: bool = False) -> str:

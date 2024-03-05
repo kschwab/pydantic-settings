@@ -1,11 +1,11 @@
 from __future__ import annotations as _annotations
 
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, TypeAdapter
 from pydantic._internal._config import config_keys
-from pydantic._internal._utils import deep_update
+from pydantic._internal._utils import is_model_class
 from pydantic.main import BaseModel
 
 from .sources import (
@@ -15,9 +15,12 @@ from .sources import (
     DotenvType,
     EnvSettingsSource,
     InitSettingsSource,
+    PathType,
     PydanticBaseSettingsSource,
     SecretsSettingsSource,
 )
+
+KeyType = TypeVar('KeyType')
 
 
 class SettingsConfigDict(ConfigDict, total=False):
@@ -37,6 +40,11 @@ class SettingsConfigDict(ConfigDict, total=False):
     cli_use_class_docs_for_groups: bool
     cli_prefix: str
     secrets_dir: str | Path | None
+    json_file: PathType | None
+    json_file_encoding: str | None
+    yaml_file: PathType | None
+    yaml_file_encoding: str | None
+    toml_file: PathType | None
 
 
 # Extend `config_keys` by pydantic settings config keys to
@@ -261,7 +269,7 @@ class BaseSettings(BaseModel):
         if cli_parse_args or cli_settings_source:
             sources = (cli_settings,) + sources
         if sources:
-            return deep_update(*reversed([source() for source in sources]))
+            return BaseSettings._deep_update(*reversed([source() for source in sources]))
         else:
             # no one should mean to do this, but I think returning an empty dict is marginally preferable
             # to an informative error and much better than a confusing error
@@ -286,6 +294,31 @@ class BaseSettings(BaseModel):
         cli_enforce_required=False,
         cli_use_class_docs_for_groups=False,
         cli_prefix='',
+        json_file=None,
+        json_file_encoding=None,
+        yaml_file=None,
+        yaml_file_encoding=None,
+        toml_file=None,
         secrets_dir=None,
         protected_namespaces=('model_', 'settings_'),
     )
+
+    @staticmethod
+    def _deep_update(mapping: dict[KeyType, Any], *updating_mappings: dict[KeyType, Any]) -> dict[KeyType, Any]:
+        """Adapts logic from `pydantic._internal._utils.deep_update` to handle nested partial overrides of BaseModel derived types."""
+        updated_mapping = mapping.copy()
+        for updating_mapping in updating_mappings:
+            for key, new_val in updating_mapping.items():
+                if key in updated_mapping:
+                    old_val = updated_mapping[key]
+                    old_val_type = type(old_val)
+                    if is_model_class(old_val_type) and isinstance(new_val, dict):
+                        old_val = old_val.model_dump()
+                    updated_mapping[key] = (
+                        TypeAdapter(old_val_type).validate_python(BaseSettings._deep_update(old_val, new_val))
+                        if isinstance(old_val, dict) and isinstance(new_val, dict)
+                        else new_val
+                    )
+                else:
+                    updated_mapping[key] = new_val
+        return updated_mapping
