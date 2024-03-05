@@ -6,6 +6,7 @@ import sys
 import typing
 import warnings
 from abc import ABC, abstractmethod
+from argparse import SUPPRESS, ArgumentParser, HelpFormatter, Namespace, _SubParsersAction
 from collections import deque
 from dataclasses import is_dataclass
 from enum import Enum
@@ -15,7 +16,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
-    Dict,
     Generic,
     List,
     Mapping,
@@ -31,7 +31,7 @@ import pydantic._internal._repr
 import pydantic.v1.utils
 import typing_extensions
 from dotenv import dotenv_values
-from pydantic import AliasChoices, AliasPath, BaseModel, Json, TypeAdapter
+from pydantic import AliasChoices, AliasPath, BaseModel, Json
 from pydantic._internal._typing_extra import WithArgsTypes, origin_is_union, typing_base
 from pydantic._internal._utils import deep_update, is_model_class, lenient_issubclass
 from pydantic.fields import FieldInfo
@@ -79,7 +79,6 @@ def import_toml() -> None:
             return
         import tomllib
 
-from argparse import SUPPRESS, ArgumentParser, HelpFormatter, Namespace, _SubParsersAction
 
 DotenvType = Union[Path, str, List[Union[Path, str]], Tuple[Union[Path, str], ...]]
 PathType = Union[Path, str, List[Union[Path, str]], Tuple[Union[Path, str], ...]]
