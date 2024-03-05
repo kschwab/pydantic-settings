@@ -31,6 +31,7 @@ class SettingsConfigDict(ConfigDict, total=False):
     env_ignore_empty: bool
     env_nested_delimiter: str | None
     env_parse_none_str: str | None
+    env_parse_enums: bool | None
     cli_prog_name: str | None
     cli_parse_args: bool | list[str] | tuple[str, ...] | None
     cli_settings_source: CliSettingsSource[Any] | None
@@ -76,6 +77,7 @@ class BaseSettings(BaseModel):
         _env_nested_delimiter: The nested env values delimiter. Defaults to `None`.
         _env_parse_none_str: The env string value that should be parsed (e.g. "null", "void", "None", etc.)
             into `None` type(None). Defaults to `None` type(None), which means no parsing should occur.
+        _env_parse_enums: Parse enum field names to values. Defaults to `None.`, which means no parsing should occur.
         _cli_prog_name: The CLI program name to display in help text. Defaults to `None` if _cli_parse_args is `None`.
             Otherwse, defaults to sys.argv[0].
         _cli_parse_args: The list of CLI arguments to parse. Defaults to None.
@@ -99,6 +101,7 @@ class BaseSettings(BaseModel):
         _env_ignore_empty: bool | None = None,
         _env_nested_delimiter: str | None = None,
         _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
         _cli_prog_name: str | None = None,
         _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
         _cli_settings_source: CliSettingsSource[Any] | None = None,
@@ -121,6 +124,7 @@ class BaseSettings(BaseModel):
                 _env_ignore_empty=_env_ignore_empty,
                 _env_nested_delimiter=_env_nested_delimiter,
                 _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
                 _cli_prog_name=_cli_prog_name,
                 _cli_parse_args=_cli_parse_args,
                 _cli_settings_source=_cli_settings_source,
@@ -167,6 +171,7 @@ class BaseSettings(BaseModel):
         _env_ignore_empty: bool | None = None,
         _env_nested_delimiter: str | None = None,
         _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
         _cli_prog_name: str | None = None,
         _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
         _cli_settings_source: CliSettingsSource[Any] | None = None,
@@ -195,6 +200,7 @@ class BaseSettings(BaseModel):
         env_parse_none_str = (
             _env_parse_none_str if _env_parse_none_str is not None else self.model_config.get('env_parse_none_str')
         )
+        env_parse_enums = _env_parse_enums if _env_parse_enums is not None else self.model_config.get('env_parse_enums')
 
         cli_prog_name = _cli_prog_name if _cli_prog_name is not None else self.model_config.get('cli_prog_name')
         cli_parse_args = _cli_parse_args if _cli_parse_args is not None else self.model_config.get('cli_parse_args')
@@ -243,6 +249,7 @@ class BaseSettings(BaseModel):
             env_nested_delimiter=env_nested_delimiter,
             env_ignore_empty=env_ignore_empty,
             env_parse_none_str=env_parse_none_str,
+            env_parse_enums=env_parse_enums,
         )
         dotenv_settings = DotEnvSettingsSource(
             self.__class__,
@@ -253,6 +260,7 @@ class BaseSettings(BaseModel):
             env_nested_delimiter=env_nested_delimiter,
             env_ignore_empty=env_ignore_empty,
             env_parse_none_str=env_parse_none_str,
+            env_parse_enums=env_parse_enums,
         )
 
         file_secret_settings = SecretsSettingsSource(
@@ -286,6 +294,7 @@ class BaseSettings(BaseModel):
         env_ignore_empty=False,
         env_nested_delimiter=None,
         env_parse_none_str=None,
+        env_parse_enums=None,
         cli_prog_name=None,
         cli_parse_args=None,
         cli_settings_source=None,

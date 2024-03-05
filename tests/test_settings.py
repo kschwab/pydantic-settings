@@ -1990,6 +1990,33 @@ def test_env_json_field(env):
     ]
 
 
+def test_env_parse_enums(env):
+    class FruitsEnum(IntEnum):
+        pear = 0
+        kiwi = 1
+        lime = 2
+
+    class Settings(BaseSettings):
+        fruit: FruitsEnum
+
+    with pytest.raises(ValidationError):
+        env.set('FRUIT', 'kiwi')
+        s = Settings()
+        assert s.fruit == FruitsEnum.kiwi
+
+    env.set('FRUIT', str(FruitsEnum.lime.value))
+    s = Settings()
+    assert s.fruit == FruitsEnum.lime
+
+    env.set('FRUIT', 'kiwi')
+    s = Settings(_env_parse_enums=True)
+    assert s.fruit == FruitsEnum.kiwi
+
+    env.set('FRUIT', str(FruitsEnum.lime.value))
+    s = Settings(_env_parse_enums=True)
+    assert s.fruit == FruitsEnum.lime
+
+
 def test_env_parse_none_str(env):
     env.set('x', 'null')
     env.set('y', 'y_override')
