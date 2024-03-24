@@ -105,8 +105,7 @@ class CliDummyParser(BaseModel, arbitrary_types_allowed=True):
 
 
 class LoggedVar(Generic[T]):
-    def get(self) -> T:
-        ...
+    def get(self) -> T: ...
 
 
 class SimpleSettings(BaseSettings):
@@ -1991,18 +1990,20 @@ def test_env_json_field(env):
 
 
 def test_env_parse_enums(env):
-    class FruitsEnum(IntEnum):
-        pear = 0
-        kiwi = 1
-        lime = 2
-
     class Settings(BaseSettings):
         fruit: FruitsEnum
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as exc_info:
         env.set('FRUIT', 'kiwi')
         s = Settings()
-        assert s.fruit == FruitsEnum.kiwi
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'int_parsing',
+            'loc': ('fruit',),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'kiwi',
+        }
+    ]
 
     env.set('FRUIT', str(FruitsEnum.lime.value))
     s = Settings()
@@ -2294,7 +2295,7 @@ def test_cli_list_arg(prefix):
 
 def test_cli_list_json_value_parsing():
     class Cfg(BaseSettings):
-        json_list: list[str | bool | None]
+        json_list: List[Union[str, bool, None]]
 
     assert Cfg(
         _cli_parse_args=[
@@ -2379,11 +2380,103 @@ def test_cli_dict_arg(prefix):
         expected['child'] = None
     assert cfg.model_dump() == expected
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         cfg = Cfg(_cli_parse_args=[f'--{prefix}check_dict', 'k9="i'])
+    assert str(exc_info.value) == f'Parsing error encountered for {prefix}check_dict: Mismatched quotes'
 
     with pytest.raises(SettingsError):
         cfg = Cfg(_cli_parse_args=[f'--{prefix}check_dict', 'k9=i"'])
+    assert str(exc_info.value) == f'Parsing error encountered for {prefix}check_dict: Mismatched quotes'
+
+
+def test_cli_union_dict_arg():
+    class Cfg(BaseSettings):
+        union_str_dict: Union[str, Dict[str, Any]]
+
+    with pytest.raises(ValidationError) as exc_info:
+        args = ['--union_str_dict', 'hello world', '--union_str_dict', 'hello world']
+        cfg = Cfg(_cli_parse_args=args)
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'input': [
+                'hello world',
+                'hello world',
+            ],
+            'loc': (
+                'union_str_dict',
+                'str',
+            ),
+            'msg': 'Input should be a valid string',
+            'type': 'string_type',
+        },
+        {
+            'input': [
+                'hello world',
+                'hello world',
+            ],
+            'loc': (
+                'union_str_dict',
+                'dict[str,any]',
+            ),
+            'msg': 'Input should be a valid dictionary',
+            'type': 'dict_type',
+        },
+    ]
+
+    args = ['--union_str_dict', 'hello world']
+    cfg = Cfg(_cli_parse_args=args)
+    assert cfg.model_dump() == {'union_str_dict': 'hello world'}
+
+    args = ['--union_str_dict', '{"hello": "world"}']
+    cfg = Cfg(_cli_parse_args=args)
+    assert cfg.model_dump() == {'union_str_dict': {'hello': 'world'}}
+
+    args = ['--union_str_dict', 'hello=world']
+    cfg = Cfg(_cli_parse_args=args)
+    assert cfg.model_dump() == {'union_str_dict': {'hello': 'world'}}
+
+    class Cfg(BaseSettings):
+        union_list_dict: Union[List[str], Dict[str, Any]]
+
+    with pytest.raises(ValidationError) as exc_info:
+        args = ['--union_list_dict', 'hello,world']
+        cfg = Cfg(_cli_parse_args=args)
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'input': 'hello,world',
+            'loc': (
+                'union_list_dict',
+                'list[str]',
+            ),
+            'msg': 'Input should be a valid list',
+            'type': 'list_type',
+        },
+        {
+            'input': 'hello,world',
+            'loc': (
+                'union_list_dict',
+                'dict[str,any]',
+            ),
+            'msg': 'Input should be a valid dictionary',
+            'type': 'dict_type',
+        },
+    ]
+
+    args = ['--union_list_dict', 'hello,world', '--union_list_dict', 'hello,world']
+    cfg = Cfg(_cli_parse_args=args)
+    assert cfg.model_dump() == {'union_list_dict': ['hello', 'world', 'hello', 'world']}
+
+    args = ['--union_list_dict', '[hello,world]']
+    cfg = Cfg(_cli_parse_args=args)
+    assert cfg.model_dump() == {'union_list_dict': ['hello', 'world']}
+
+    args = ['--union_list_dict', '{"hello": "world"}']
+    cfg = Cfg(_cli_parse_args=args)
+    assert cfg.model_dump() == {'union_list_dict': {'hello': 'world'}}
+
+    args = ['--union_list_dict', 'hello=world']
+    cfg = Cfg(_cli_parse_args=args)
+    assert cfg.model_dump() == {'union_list_dict': {'hello': 'world'}}
 
 
 def test_cli_nested_dict_arg():
@@ -2394,13 +2487,18 @@ def test_cli_nested_dict_arg():
     cfg = Cfg(_cli_parse_args=args)
     assert cfg.model_dump() == {'check_dict': {'k1': {'a': 1}, 'k2': {'b': 2}}}
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         args = ['--check_dict', '{"k1":{"a": 1}},"k2":{"b": 2}}']
         cfg = Cfg(_cli_parse_args=args)
+    assert (
+        str(exc_info.value)
+        == 'Parsing error encountered for check_dict: not enough values to unpack (expected 2, got 1)'
+    )
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         args = ['--check_dict', '{"k1":{"a": 1}},{"k2":{"b": 2}']
         cfg = Cfg(_cli_parse_args=args)
+    assert str(exc_info.value) == 'Parsing error encountered for check_dict: Missing end delimiter "}"'
 
 
 def test_cli_subcommand_with_positionals():
@@ -2468,8 +2566,6 @@ def test_cli_union_similar_sub_models():
     assert cfg.model_dump() == {'child': {'name': 'new name a', 'diff_a': 'new diff a'}}
 
 
-# TODO Remove skip once environment parsing support for enums is added
-@pytest.mark.skip
 def test_cli_enums():
     class Pet(IntEnum):
         dog = 0
@@ -2482,8 +2578,16 @@ def test_cli_enums():
     cfg = Cfg(_cli_parse_args=['--pet', 'cat'])
     assert cfg.model_dump() == {'pet': Pet.cat}
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as exc_info:
         Cfg(_cli_parse_args=['--pet', 'rock'])
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'int_parsing',
+            'loc': ('pet',),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'rock',
+        }
+    ]
 
 
 def test_cli_literals():
@@ -2493,8 +2597,17 @@ def test_cli_literals():
     cfg = Cfg(_cli_parse_args=['--pet', 'cat'])
     assert cfg.model_dump() == {'pet': 'cat'}
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as exc_info:
         Cfg(_cli_parse_args=['--pet', 'rock'])
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'ctx': {'expected': "'dog', 'cat' or 'bird'"},
+            'type': 'literal_error',
+            'loc': ('pet',),
+            'msg': "Input should be 'dog', 'cat' or 'bird'",
+            'input': 'rock',
+        }
+    ]
 
 
 def test_cli_annotation_exceptions(monkeypatch):
@@ -2507,54 +2620,63 @@ def test_cli_annotation_exceptions(monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(sys, 'argv', ['example.py', '--help'])
 
-        with pytest.raises(SettingsError):
+        with pytest.raises(SettingsError) as exc_info:
 
             class SubCommandNotOutermost(BaseSettings, cli_parse_args=True):
                 subcmd: Union[int, CliSubCommand[SubCmd]]
 
             SubCommandNotOutermost()
+        assert str(exc_info.value) == 'CliSubCommand is not outermost annotation for SubCommandNotOutermost.subcmd'
 
-        with pytest.raises(SettingsError):
+        with pytest.raises(SettingsError) as exc_info:
 
             class SubCommandHasDefault(BaseSettings, cli_parse_args=True):
                 subcmd: CliSubCommand[SubCmd] = SubCmd()
 
             SubCommandHasDefault()
+        assert str(exc_info.value) == 'subcommand argument SubCommandHasDefault.subcmd has a default value'
 
-        with pytest.raises(SettingsError):
+        with pytest.raises(SettingsError) as exc_info:
 
             class SubCommandMultipleTypes(BaseSettings, cli_parse_args=True):
                 subcmd: CliSubCommand[Union[SubCmd, SubCmdAlt]]
 
             SubCommandMultipleTypes()
+        assert str(exc_info.value) == 'subcommand argument SubCommandMultipleTypes.subcmd has multiple types'
 
-        with pytest.raises(SettingsError):
+        with pytest.raises(SettingsError) as exc_info:
 
             class SubCommandNotModel(BaseSettings, cli_parse_args=True):
                 subcmd: CliSubCommand[str]
 
             SubCommandNotModel()
+        assert str(exc_info.value) == 'subcommand argument SubCommandNotModel.subcmd is not derived from BaseModel'
 
-        with pytest.raises(SettingsError):
+        with pytest.raises(SettingsError) as exc_info:
 
             class PositionalArgNotOutermost(BaseSettings, cli_parse_args=True):
                 pos_arg: Union[int, CliPositionalArg[str]]
 
             PositionalArgNotOutermost()
+        assert (
+            str(exc_info.value) == 'CliPositionalArg is not outermost annotation for PositionalArgNotOutermost.pos_arg'
+        )
 
-        with pytest.raises(SettingsError):
+        with pytest.raises(SettingsError) as exc_info:
 
             class PositionalArgHasDefault(BaseSettings, cli_parse_args=True):
                 pos_arg: CliPositionalArg[str] = 'bad'
 
             PositionalArgHasDefault()
+        assert str(exc_info.value) == 'positional argument PositionalArgHasDefault.pos_arg has a default value'
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
 
         class InvalidCliParseArgsType(BaseSettings, cli_parse_args='invalid type'):
             val: int
 
         InvalidCliParseArgsType()
+    assert str(exc_info.value) == "cli_parse_args must be List[str] or Tuple[str, ...], recieved <class 'str'>"
 
 
 def test_cli_avoid_json(capsys, monkeypatch):
@@ -2803,15 +2925,18 @@ def test_cli_user_settings_source(parser_type, prefix):
     parsed_args = parse_args(args)
     assert Cfg(_cli_settings_source=cli_cfg_settings(parsed_args=parsed_args)).model_dump() == {'pet': 'bird'}
     assert Cfg(_cli_settings_source=cli_cfg_settings(args=args)).model_dump() == {'pet': 'bird'}
+    assert Cfg(_cli_settings_source=cli_cfg_settings(args=False)).model_dump() == {'pet': 'bird'}
 
     arg_prefix = f'{prefix}.' if prefix else ''
     args = ['--fruit', 'kiwi', f'--{arg_prefix}pet', 'dog']
     parsed_args = parse_args(args)
     assert Cfg(_cli_settings_source=cli_cfg_settings(parsed_args=parsed_args)).model_dump() == {'pet': 'dog'}
     assert Cfg(_cli_settings_source=cli_cfg_settings(args=args)).model_dump() == {'pet': 'dog'}
+    assert Cfg(_cli_settings_source=cli_cfg_settings(args=False)).model_dump() == {'pet': 'bird'}
 
     parsed_args = parse_args(['--fruit', 'kiwi', f'--{arg_prefix}pet', 'cat'])
     assert Cfg(_cli_settings_source=cli_cfg_settings(parsed_args=vars(parsed_args))).model_dump() == {'pet': 'cat'}
+    assert Cfg(_cli_settings_source=cli_cfg_settings(args=False)).model_dump() == {'pet': 'bird'}
 
 
 @pytest.mark.parametrize('prefix', ['', 'cfg'])
@@ -2883,20 +3008,24 @@ def test_cli_user_settings_source_exceptions():
     class Cfg(BaseSettings):
         pet: Literal['dog', 'cat', 'bird'] = 'bird'
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         args = ['--pet', 'dog']
         parsed_args = {'pet': 'dog'}
         cli_cfg_settings = CliSettingsSource(Cfg)
         Cfg(_cli_settings_source=cli_cfg_settings(args=args, parsed_args=parsed_args))
+    assert str(exc_info.value) == '`args` and `parsed_args` are mutually exclusive'
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         CliSettingsSource(Cfg, cli_prefix='.cfg')
+    assert str(exc_info.value) == 'CLI settings source prefix is invalid: .cfg'
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         CliSettingsSource(Cfg, cli_prefix='cfg.')
+    assert str(exc_info.value) == 'CLI settings source prefix is invalid: cfg.'
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         CliSettingsSource(Cfg, cli_prefix='123')
+    assert str(exc_info.value) == 'CLI settings source prefix is invalid: 123'
 
     class Food(BaseModel):
         fruit: FruitsEnum = FruitsEnum.kiwi
@@ -2905,8 +3034,12 @@ def test_cli_user_settings_source_exceptions():
         pet: Literal['dog', 'cat', 'bird'] = 'bird'
         food: CliSubCommand[Food]
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError) as exc_info:
         CliSettingsSource(CfgWithSubCommand, add_subparsers_method=None)
+    assert (
+        str(exc_info.value)
+        == 'cannot connect CLI settings source root parser: add_subparsers_method is set to `None` but is needed for connecting'
+    )
 
 
 @pytest.mark.parametrize(
@@ -2941,20 +3074,27 @@ def test_cli_user_settings_source_exceptions():
         (FruitsEnum, '{pear,kiwi,lime}'),
     ],
 )
-def test_cli_metavar_format(value, expected):
-    assert CliSettingsSource(SimpleSettings)._metavar_format(value) == expected
+@pytest.mark.parametrize('hide_none_type', [True, False])
+def test_cli_metavar_format(hide_none_type, value, expected):
+    cli_settings = CliSettingsSource(SimpleSettings, cli_hide_none_type=hide_none_type)
+    if hide_none_type:
+        if value == [1, 2, 3] or isinstance(value, LoggedVar) or isinstance(value, Representation):
+            pytest.skip()
+        if value in ('foobar', 'SomeForwardRefString'):
+            expected = f"ForwardRef('{value}')"  # forward ref implicit cast
+        if typing_extensions.get_origin(value) is Union:
+            args = typing_extensions.get_args(value)
+            value = Union[args + (None,) if args else (value, None)]
+        else:
+            value = Union[(value, None)]
+    assert cli_settings._metavar_format(value) == expected
 
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason='requires python 3.10 or higher')
 @pytest.mark.parametrize(
     'value_gen,expected',
     [
-        (lambda: str, 'str'),
-        (lambda: 'SomeForwardRefString', 'str'),  # included to document current behavior; could be changed
-        (lambda: List['SomeForwardRef'], "List[ForwardRef('SomeForwardRef')]"),  # noqa: F821
         (lambda: str | int, '{str,int}'),
-        (lambda: list, 'list'),
-        (lambda: List, 'List'),
         (lambda: list[int], 'list[int]'),
         (lambda: List[int], 'List[int]'),
         (lambda: list[dict[str, int]], 'list[dict[str,int]]'),
@@ -2964,9 +3104,19 @@ def test_cli_metavar_format(value, expected):
         (lambda: LoggedVar[Dict[int, str]], 'LoggedVar[Dict[int,str]]'),
     ],
 )
-def test_cli_metavar_format_310(value_gen, expected):
+@pytest.mark.parametrize('hide_none_type', [True, False])
+def test_cli_metavar_format_310(hide_none_type, value_gen, expected):
     value = value_gen()
-    assert CliSettingsSource(SimpleSettings)._metavar_format(value) == expected
+    cli_settings = CliSettingsSource(SimpleSettings, cli_hide_none_type=hide_none_type)
+    if hide_none_type:
+        if value == 'SomeForwardRefString':
+            expected = f"ForwardRef('{value}')"  # forward ref implicit cast
+        if typing_extensions.get_origin(value) is Union:
+            args = typing_extensions.get_args(value)
+            value = Union[args + (None,) if args else (value, None)]
+        else:
+            value = Union[(value, None)]
+    assert cli_settings._metavar_format(value) == expected
 
 
 @pytest.mark.skipif(sys.version_info < (3, 12), reason='requires python 3.12 or higher')
@@ -3238,72 +3388,3 @@ def test_multiple_file_json(tmp_path):
 
     s = Settings()
     assert s.model_dump() == {'json5': 5, 'json6': 6}
-
-
-def test_dotenv_with_alias_and_env_prefix(tmp_path):
-    p = tmp_path / '.env'
-    p.write_text('xxx__foo=1\nxxx__bar=2')
-
-    class Settings(BaseSettings):
-        model_config = SettingsConfigDict(env_file=p, env_prefix='xxx__')
-
-        foo: str = ''
-        bar_alias: str = Field('', validation_alias='xxx__bar')
-
-    s = Settings()
-    assert s.model_dump() == {'foo': '1', 'bar_alias': '2'}
-
-    class Settings1(BaseSettings):
-        model_config = SettingsConfigDict(env_file=p, env_prefix='xxx__')
-
-        foo: str = ''
-        bar_alias: str = Field('', alias='bar')
-
-    with pytest.raises(ValidationError) as exc_info:
-        Settings1()
-    assert exc_info.value.errors(include_url=False) == [
-        {'type': 'extra_forbidden', 'loc': ('xxx__bar',), 'msg': 'Extra inputs are not permitted', 'input': '2'}
-    ]
-
-
-def test_dotenv_with_alias_and_env_prefix_nested(tmp_path):
-    p = tmp_path / '.env'
-    p.write_text('xxx__bar=0\nxxx__nested__a=1\nxxx__nested__b=2')
-
-    class NestedSettings(BaseModel):
-        a: str = 'a'
-        b: str = 'b'
-
-    class Settings(BaseSettings):
-        model_config = SettingsConfigDict(env_prefix='xxx__', env_nested_delimiter='__', env_file=p)
-
-        foo: str = ''
-        bar_alias: str = Field('', alias='xxx__bar')
-        nested_alias: NestedSettings = Field(default_factory=NestedSettings, alias='xxx__nested')
-
-    s = Settings()
-    assert s.model_dump() == {'foo': '', 'bar_alias': '0', 'nested_alias': {'a': '1', 'b': '2'}}
-
-
-def test_dotenv_with_extra_and_env_prefix(tmp_path):
-    p = tmp_path / '.env'
-    p.write_text('xxx__foo=1\nxxx__extra_var=extra_value')
-
-    class Settings(BaseSettings):
-        model_config = SettingsConfigDict(extra='allow', env_file=p, env_prefix='xxx__')
-
-        foo: str = ''
-
-    s = Settings()
-    assert s.model_dump() == {'foo': '1', 'extra_var': 'extra_value'}
-
-
-def test_nested_field_with_alias_init_source():
-    class NestedSettings(BaseModel):
-        foo: str = Field(alias='fooAlias')
-
-    class Settings(BaseSettings):
-        nested_foo: NestedSettings
-
-    s = Settings(nested_foo=NestedSettings(fooAlias='EXAMPLE'))
-    assert s.model_dump() == {'nested_foo': {'foo': 'EXAMPLE'}}

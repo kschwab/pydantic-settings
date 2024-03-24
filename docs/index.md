@@ -536,55 +536,6 @@ Settings(
 Note that a CLI settings source is always [**the topmost source**](#field-value-priority) and does not support [changing
 its priority](#changing-priority).
 
-#### Integrating with Existing Parsers
-
-A CLI settings source can be integrated with existing parsers by overriding the default CLI settings source with a user
-defined one that specifies the `root_parser` object.
-
-```py
-import sys
-from argparse import ArgumentParser
-
-from pydantic_settings import BaseSettings, CliSettingsSource
-
-parser = ArgumentParser()
-parser.add_argument('--food', choices=['pear', 'kiwi', 'lime'])
-
-
-class Settings(BaseSettings):
-    name: str = 'Bob'
-
-
-# Set existing `parser` as the `root_parser` object for the user defined settings source
-cli_settings = CliSettingsSource(Settings, root_parser=parser)
-
-# Parse and load CLI settings from the command line into the settings source.
-sys.argv = ['example.py', '--food', 'kiwi', '--name', 'waldo']
-print(Settings(_cli_settings_source=cli_settings(args=True)).model_dump())
-#> {'name': 'waldo'}
-
-# Load CLI settings from pre-parsed arguments. i.e., the parsing occurs elsewhere and we
-# just need to load the pre-parsed args into the settings source.
-parsed_args = parser.parse_args(['--food', 'kiwi', '--name', 'ralph'])
-print(Settings(_cli_settings_source=cli_settings(parsed_args=parsed_args)).model_dump())
-#> {'name': 'ralph'}
-```
-
-A `CliSettingsSource` connects with a `root_parser` object by using parser methods to add `settings_cls` fields as
-command line arguments. The `CliSettingsSource` internal parser representation is based on the `argparse` library, and
-therefore, requires parser methods that support the same attributes as their `argparse` counterparts. The available
-parser methods that can be customised, along with their argparse counterparts (the defaults), are listed below:
-
-* `parse_args_method` - argparse.ArgumentParser.parse_args
-* `add_argument_method` - argparse.ArgumentParser.add_argument
-* `add_argument_group_method` - argparse.ArgumentParser.add\_argument_group
-* `add_parser_method` - argparse.\_SubParsersAction.add_parser
-* `add_subparsers_method` - argparse.ArgumentParser.add_subparsers
-* `formatter_class` - argparse.HelpFormatter
-
-For a non-argparse parser the parser methods can be set to `None` if not supported. The CLI settings will only raise an
-error when connecting to the root parser if a parser method is necessary but set to `None`.
-
 #### Lists
 
 CLI argument parsing of lists supports intermixing of any of the below three styles:
@@ -652,8 +603,7 @@ print(Settings().model_dump())
 
 CLI argument parsing of literals and enums are converted into CLI choices.
 
-<!-- TODO Remove skip once environment parsing support for enums is added -->
-```py test="skip"
+```py
 import sys
 from enum import IntEnum
 from typing import Literal
@@ -816,15 +766,18 @@ The below flags can be used to customise the CLI experience to your needs.
 Change the default program name displayed in the help text usage by setting `cli_prog_name`. By default, it will derive the name of the currently
 executing program from `sys.argv[0]`, just like argparse.
 
-```py
-from pydantic_settings import BaseSettings, CliSettingsSource
+```py test="skip"
+import sys
+
+from pydantic_settings import BaseSettings
 
 
-class Settings(BaseSettings, cli_prog_name='appdantic'):
+class Settings(BaseSettings, cli_parse_args=True, cli_prog_name='appdantic'):
     pass
 
 
-print(CliSettingsSource(Settings).root_parser.format_help())
+sys.argv = ['example.py', '--help']
+Settings()
 """
 usage: appdantic [-h]
 
@@ -874,19 +827,21 @@ example.py: error: the following arguments are required: --my_required_field
 
 Hide `None` values from the CLI help text by enabling `cli_hide_none_type`.
 
-```py
+```py test="skip"
+import sys
 from typing import Optional
 
 from pydantic import Field
 
-from pydantic_settings import BaseSettings, CliSettingsSource
+from pydantic_settings import BaseSettings
 
 
-class Settings(BaseSettings, cli_hide_none_type=True):
+class Settings(BaseSettings, cli_parse_args=True, cli_hide_none_type=True):
     v0: Optional[str] = Field(description='the top level v0 option')
 
 
-print(CliSettingsSource(Settings, cli_prog_name='example.py').root_parser.format_help())
+sys.argv = ['example.py', '--help']
+Settings()
 """
 usage: example.py [-h] [--v0 str]
 
@@ -900,23 +855,26 @@ options:
 
 Avoid adding complex fields that result in JSON strings at the CLI by enabling `cli_avoid_json`.
 
-```py
+```py test="skip"
+import sys
+
 from pydantic import BaseModel, Field
 
-from pydantic_settings import BaseSettings, CliSettingsSource
+from pydantic_settings import BaseSettings
 
 
 class SubModel(BaseModel):
     v1: int = Field(description='the sub model v1 option')
 
 
-class Settings(BaseSettings, cli_avoid_json=True):
+class Settings(BaseSettings, cli_parse_args=True, cli_avoid_json=True):
     sub_model: SubModel = Field(
         description='The help summary for SubModel related options'
     )
 
 
-print(CliSettingsSource(Settings, cli_prog_name='example.py').root_parser.format_help())
+sys.argv = ['example.py', '--help']
+Settings()
 """
 usage: example.py [-h] [--sub_model.v1 int]
 
@@ -939,10 +897,12 @@ Alternatively, we can also configure CLI settings to pull from the class docstri
     If the field is a union of nested models the group help text will always be pulled from the field description;
     even if `cli_use_class_docs_for_groups` is set to `True`.
 
-```py
+```py test="skip"
+import sys
+
 from pydantic import BaseModel, Field
 
-from pydantic_settings import BaseSettings, CliSettingsSource
+from pydantic_settings import BaseSettings
 
 
 class SubModel(BaseModel):
@@ -951,13 +911,14 @@ class SubModel(BaseModel):
     v1: int = Field(description='the sub model v1 option')
 
 
-class Settings(BaseSettings, cli_use_class_docs_for_groups=True):
+class Settings(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=True):
     """My application help text."""
 
     sub_model: SubModel = Field(description='The help text from the field description')
 
 
-print(CliSettingsSource(Settings, cli_prog_name='example.py').root_parser.format_help())
+sys.argv = ['example.py', '--help']
+Settings()
 """
 usage: example.py [-h] [--sub_model JSON] [--sub_model.v1 int]
 
@@ -978,6 +939,55 @@ sub_model options:
     Pydantic settings loads all the values from dotenv file and passes it to the model, regardless of the model's `env_prefix`.
     So if you provide extra values in a dotenv file, whether they start with `env_prefix` or not,
     a `ValidationError` will be raised.
+
+### Integrating with Existing Parsers
+
+A CLI settings source can be integrated with existing parsers by overriding the default CLI settings source with a user
+defined one that specifies the `root_parser` object.
+
+```py
+import sys
+from argparse import ArgumentParser
+
+from pydantic_settings import BaseSettings, CliSettingsSource
+
+parser = ArgumentParser()
+parser.add_argument('--food', choices=['pear', 'kiwi', 'lime'])
+
+
+class Settings(BaseSettings):
+    name: str = 'Bob'
+
+
+# Set existing `parser` as the `root_parser` object for the user defined settings source
+cli_settings = CliSettingsSource(Settings, root_parser=parser)
+
+# Parse and load CLI settings from the command line into the settings source.
+sys.argv = ['example.py', '--food', 'kiwi', '--name', 'waldo']
+print(Settings(_cli_settings_source=cli_settings(args=True)).model_dump())
+#> {'name': 'waldo'}
+
+# Load CLI settings from pre-parsed arguments. i.e., the parsing occurs elsewhere and we
+# just need to load the pre-parsed args into the settings source.
+parsed_args = parser.parse_args(['--food', 'kiwi', '--name', 'ralph'])
+print(Settings(_cli_settings_source=cli_settings(parsed_args=parsed_args)).model_dump())
+#> {'name': 'ralph'}
+```
+
+A `CliSettingsSource` connects with a `root_parser` object by using parser methods to add `settings_cls` fields as
+command line arguments. The `CliSettingsSource` internal parser representation is based on the `argparse` library, and
+therefore, requires parser methods that support the same attributes as their `argparse` counterparts. The available
+parser methods that can be customised, along with their argparse counterparts (the defaults), are listed below:
+
+* `parse_args_method` - argparse.ArgumentParser.parse_args
+* `add_argument_method` - argparse.ArgumentParser.add_argument
+* `add_argument_group_method` - argparse.ArgumentParser.add\_argument_group
+* `add_parser_method` - argparse.\_SubParsersAction.add_parser
+* `add_subparsers_method` - argparse.ArgumentParser.add_subparsers
+* `formatter_class` - argparse.HelpFormatter
+
+For a non-argparse parser the parser methods can be set to `None` if not supported. The CLI settings will only raise an
+error when connecting to the root parser if a parser method is necessary but set to `None`.
 
 ## Secrets
 
