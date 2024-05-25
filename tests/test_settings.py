@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, List, Literal, Optional, Set, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Generic, Hashable, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 import pytest
 import typing_extensions
@@ -19,19 +19,22 @@ from pydantic import (
     AliasPath,
     BaseModel,
     DirectoryPath,
+    Discriminator,
     Field,
     HttpUrl,
     Json,
     RootModel,
     SecretStr,
+    Tag,
     ValidationError,
 )
 from pydantic import (
     dataclasses as pydantic_dataclasses,
 )
+from pydantic._internal._repr import Representation
 from pydantic.fields import FieldInfo
-from pydantic.v1.utils import Representation
-from typing_extensions import Annotated
+from pytest_mock import MockerFixture
+from typing_extensions import Annotated, Literal
 
 from pydantic_settings import (
     BaseSettings,
@@ -40,6 +43,7 @@ from pydantic_settings import (
     InitSettingsSource,
     JsonConfigSettingsSource,
     PydanticBaseSettingsSource,
+    PyprojectTomlConfigSettingsSource,
     SecretsSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
@@ -316,7 +320,7 @@ def test_nested_env_delimiter_complex_required(env):
 
 
 def test_nested_env_delimiter_aliases(env):
-    class SubModel(BaseSettings):
+    class SubModel(BaseModel):
         v1: str
         v2: str
 
@@ -1807,6 +1811,44 @@ def test_nested_env_union_complex_values(env):
         Cfg()
 
 
+def test_discriminated_union_with_callable_discriminator(env):
+    class A(BaseModel):
+        x: Literal['a'] = 'a'
+        y: str
+
+    class B(BaseModel):
+        x: Literal['b'] = 'b'
+        z: str
+
+    def get_discriminator_value(v: Any) -> Hashable:
+        if isinstance(v, dict):
+            v0 = v.get('x')
+        else:
+            v0 = getattr(v, 'x', None)
+
+        if v0 == 'a':
+            return 'a'
+        elif v0 == 'b':
+            return 'b'
+        else:
+            return None
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_nested_delimiter='__')
+
+        # Discriminated union using a callable discriminator.
+        a_or_b: Annotated[Union[Annotated[A, Tag('a')], Annotated[B, Tag('b')]], Discriminator(get_discriminator_value)]
+
+    # Set up environment so that the discriminator is 'a'.
+    env.set('a_or_b__x', 'a')
+    env.set('a_or_b__y', 'foo')
+
+    s = Settings()
+
+    assert s.a_or_b.x == 'a'
+    assert s.a_or_b.y == 'foo'
+
+
 def test_nested_model_case_insensitive(env):
     class SubSubSub(BaseModel):
         VaL3: str
@@ -1998,10 +2040,11 @@ def test_env_parse_enums(env):
         s = Settings()
     assert exc_info.value.errors(include_url=False) == [
         {
-            'type': 'int_parsing',
+            'type': 'enum',
             'loc': ('fruit',),
-            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'msg': 'Input should be 0, 1 or 2',
             'input': 'kiwi',
+            'ctx': {'expected': '0, 1 or 2'},
         }
     ]
 
@@ -2210,6 +2253,80 @@ def test_cli_nested_arg():
             'sub': {'v4': '4', 'v5': 5, 'sub_sub': {'v6': '6'}},
         },
     }
+
+
+def test_cli_source_prioritization(env):
+    class CfgDefault(BaseSettings):
+        foo: str
+
+    class CfgPrioritized(BaseSettings):
+        foo: str
+
+        @classmethod
+        def settings_customise_sources(
+            cls,
+            settings_cls: Type[BaseSettings],
+            init_settings: PydanticBaseSettingsSource,
+            env_settings: PydanticBaseSettingsSource,
+            dotenv_settings: PydanticBaseSettingsSource,
+            file_secret_settings: PydanticBaseSettingsSource,
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return env_settings, CliSettingsSource(settings_cls, cli_parse_args=['--foo', 'FOO FROM CLI'])
+
+    env.set('FOO', 'FOO FROM ENV')
+
+    cfg = CfgDefault(_cli_parse_args=['--foo', 'FOO FROM CLI'])
+    assert cfg.model_dump() == {'foo': 'FOO FROM CLI'}
+
+    cfg = CfgPrioritized()
+    assert cfg.model_dump() == {'foo': 'FOO FROM ENV'}
+
+
+def test_cli_alias_arg():
+    class Animal(BaseModel):
+        name: str
+
+    class Cfg(BaseSettings):
+        apple: str = Field(alias='alias')
+        pet: Animal = Field(alias='critter')
+
+    cfg = Cfg(_cli_parse_args=['--alias', 'foo', '--critter.name', 'harry'])
+    assert cfg.model_dump() == {'apple': 'foo', 'pet': {'name': 'harry'}}
+    assert cfg.model_dump(by_alias=True) == {'alias': 'foo', 'critter': {'name': 'harry'}}
+
+
+def test_cli_case_insensitve_arg():
+    class Cfg(BaseSettings):
+        Foo: str
+        Bar: str
+
+    cfg = Cfg(_cli_parse_args=['--FOO=--VAL', '--BAR', '"--VAL"'])
+    assert cfg.model_dump() == {'Foo': '--VAL', 'Bar': '"--VAL"'}
+
+    cfg = Cfg(_cli_parse_args=['--Foo=--VAL', '--Bar', '"--VAL"'], _case_sensitive=True)
+    assert cfg.model_dump() == {'Foo': '--VAL', 'Bar': '"--VAL"'}
+
+    with pytest.raises(SystemExit):
+        Cfg(_cli_parse_args=['--FOO=--VAL', '--BAR', '"--VAL"'], _case_sensitive=True)
+
+    with pytest.raises(SettingsError) as exc_info:
+        CliSettingsSource(Cfg, root_parser=CliDummyParser(), case_sensitive=False)
+    assert str(exc_info.value) == 'Case-insensitive matching is only supported on the internal root parser'
+
+
+def test_cli_nested_dataclass_arg():
+    @pydantic_dataclasses.dataclass
+    class MyDataclass:
+        foo: int
+        bar: str
+
+    class Settings(BaseSettings):
+        n: MyDataclass
+
+    s = Settings(_cli_parse_args=['--n.foo', '123', '--n.bar', 'bar value'])
+    assert isinstance(s.n, MyDataclass)
+    assert s.n.foo == 123
+    assert s.n.bar == 'bar value'
 
 
 @pytest.mark.parametrize('prefix', ['', 'child.'])
@@ -2614,10 +2731,11 @@ def test_cli_enums():
         Cfg(_cli_parse_args=['--pet', 'rock'])
     assert exc_info.value.errors(include_url=False) == [
         {
-            'type': 'int_parsing',
+            'type': 'enum',
             'loc': ('pet',),
-            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'msg': 'Input should be 0, 1 or 2',
             'input': 'rock',
+            'ctx': {'expected': '0, 1 or 2'},
         }
     ]
 
@@ -3325,6 +3443,225 @@ def test_toml_no_file():
 
 
 @pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
+def test_pyproject_toml_file(cd_tmp_path: Path):
+    pyproject = cd_tmp_path / 'pyproject.toml'
+    pyproject.write_text(
+        """
+    [tool.pydantic-settings]
+    foobar = "Hello"
+
+    [tool.pydantic-settings.nested]
+    nested_field = "world!"
+    """
+    )
+
+    class Nested(BaseModel):
+        nested_field: str
+
+    class Settings(BaseSettings):
+        foobar: str
+        nested: Nested
+        model_config = SettingsConfigDict()
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls: Type[BaseSettings], **_kwargs: PydanticBaseSettingsSource
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return (PyprojectTomlConfigSettingsSource(settings_cls),)
+
+    s = Settings()
+    assert s.foobar == 'Hello'
+    assert s.nested.nested_field == 'world!'
+
+
+@pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
+def test_pyproject_toml_file_explicit(cd_tmp_path: Path):
+    pyproject = cd_tmp_path / 'child' / 'grandchild' / 'pyproject.toml'
+    pyproject.parent.mkdir(parents=True)
+    pyproject.write_text(
+        """
+    [tool.pydantic-settings]
+    foobar = "Hello"
+
+    [tool.pydantic-settings.nested]
+    nested_field = "world!"
+    """
+    )
+    (cd_tmp_path / 'pyproject.toml').write_text(
+        """
+    [tool.pydantic-settings]
+    foobar = "fail"
+
+    [tool.pydantic-settings.nested]
+    nested_field = "fail"
+    """
+    )
+
+    class Nested(BaseModel):
+        nested_field: str
+
+    class Settings(BaseSettings):
+        foobar: str
+        nested: Nested
+        model_config = SettingsConfigDict()
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls: Type[BaseSettings], **_kwargs: PydanticBaseSettingsSource
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return (PyprojectTomlConfigSettingsSource(settings_cls, pyproject),)
+
+    s = Settings()
+    assert s.foobar == 'Hello'
+    assert s.nested.nested_field == 'world!'
+
+
+@pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
+def test_pyproject_toml_file_parent(mocker: MockerFixture, tmp_path: Path):
+    cwd = tmp_path / 'child' / 'grandchild' / 'cwd'
+    cwd.mkdir(parents=True)
+    mocker.patch('pydantic_settings.sources.Path.cwd', return_value=cwd)
+    (cwd.parent.parent / 'pyproject.toml').write_text(
+        """
+    [tool.pydantic-settings]
+    foobar = "Hello"
+
+    [tool.pydantic-settings.nested]
+    nested_field = "world!"
+    """
+    )
+    (tmp_path / 'pyproject.toml').write_text(
+        """
+    [tool.pydantic-settings]
+    foobar = "fail"
+
+    [tool.pydantic-settings.nested]
+    nested_field = "fail"
+    """
+    )
+
+    class Nested(BaseModel):
+        nested_field: str
+
+    class Settings(BaseSettings):
+        foobar: str
+        nested: Nested
+        model_config = SettingsConfigDict(pyproject_toml_depth=2)
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls: Type[BaseSettings], **_kwargs: PydanticBaseSettingsSource
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return (PyprojectTomlConfigSettingsSource(settings_cls),)
+
+    s = Settings()
+    assert s.foobar == 'Hello'
+    assert s.nested.nested_field == 'world!'
+
+
+@pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
+def test_pyproject_toml_file_header(cd_tmp_path: Path):
+    pyproject = cd_tmp_path / 'subdir' / 'pyproject.toml'
+    pyproject.parent.mkdir()
+    pyproject.write_text(
+        """
+    [tool.pydantic-settings]
+    foobar = "Hello"
+
+    [tool.pydantic-settings.nested]
+    nested_field = "world!"
+
+    [tool."my.tool".foo]
+    status = "success"
+    """
+    )
+
+    class Settings(BaseSettings):
+        status: str
+        model_config = SettingsConfigDict(extra='forbid', pyproject_toml_table_header=('tool', 'my.tool', 'foo'))
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls: Type[BaseSettings], **_kwargs: PydanticBaseSettingsSource
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return (PyprojectTomlConfigSettingsSource(settings_cls, pyproject),)
+
+    s = Settings()
+    assert s.status == 'success'
+
+
+@pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
+@pytest.mark.parametrize('depth', [0, 99])
+def test_pyproject_toml_no_file(cd_tmp_path: Path, depth: int):
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(pyproject_toml_depth=depth)
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls: Type[BaseSettings], **_kwargs: PydanticBaseSettingsSource
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return (PyprojectTomlConfigSettingsSource(settings_cls),)
+
+    s = Settings()
+    assert s.model_dump() == {}
+
+
+@pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
+def test_pyproject_toml_no_file_explicit(tmp_path: Path):
+    pyproject = tmp_path / 'child' / 'pyproject.toml'
+    (tmp_path / 'pyproject.toml').write_text('[tool.pydantic-settings]\nfield = "fail"')
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict()
+
+        field: Optional[str] = None
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls: Type[BaseSettings], **_kwargs: PydanticBaseSettingsSource
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return (PyprojectTomlConfigSettingsSource(settings_cls, pyproject),)
+
+    s = Settings()
+    assert s.model_dump() == {'field': None}
+
+
+@pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
+@pytest.mark.parametrize('depth', [0, 1, 2])
+def test_pyproject_toml_no_file_too_shallow(depth: int, mocker: MockerFixture, tmp_path: Path):
+    cwd = tmp_path / 'child' / 'grandchild' / 'cwd'
+    cwd.mkdir(parents=True)
+    mocker.patch('pydantic_settings.sources.Path.cwd', return_value=cwd)
+    (tmp_path / 'pyproject.toml').write_text(
+        """
+    [tool.pydantic-settings]
+    foobar = "fail"
+
+    [tool.pydantic-settings.nested]
+    nested_field = "fail"
+    """
+    )
+
+    class Nested(BaseModel):
+        nested_field: Optional[str] = None
+
+    class Settings(BaseSettings):
+        foobar: Optional[str] = None
+        nested: Nested = Nested()
+        model_config = SettingsConfigDict(pyproject_toml_depth=depth)
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls: Type[BaseSettings], **_kwargs: PydanticBaseSettingsSource
+        ) -> Tuple[PydanticBaseSettingsSource, ...]:
+            return (PyprojectTomlConfigSettingsSource(settings_cls),)
+
+    s = Settings()
+    assert not s.foobar
+    assert not s.nested.nested_field
+
+
+@pytest.mark.skipif(sys.version_info <= (3, 11) and tomli is None, reason='tomli/tomllib is not installed')
 def test_multiple_file_toml(tmp_path):
     p1 = tmp_path / '.env.toml1'
     p2 = tmp_path / '.env.toml2'
@@ -3418,3 +3755,110 @@ def test_multiple_file_json(tmp_path):
 
     s = Settings()
     assert s.model_dump() == {'json5': 5, 'json6': 6}
+
+
+def test_dotenv_with_alias_and_env_prefix(tmp_path):
+    p = tmp_path / '.env'
+    p.write_text('xxx__foo=1\nxxx__bar=2')
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_file=p, env_prefix='xxx__')
+
+        foo: str = ''
+        bar_alias: str = Field('', validation_alias='xxx__bar')
+
+    s = Settings()
+    assert s.model_dump() == {'foo': '1', 'bar_alias': '2'}
+
+    class Settings1(BaseSettings):
+        model_config = SettingsConfigDict(env_file=p, env_prefix='xxx__')
+
+        foo: str = ''
+        bar_alias: str = Field('', alias='bar')
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings1()
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'extra_forbidden', 'loc': ('xxx__bar',), 'msg': 'Extra inputs are not permitted', 'input': '2'}
+    ]
+
+
+def test_dotenv_with_alias_and_env_prefix_nested(tmp_path):
+    p = tmp_path / '.env'
+    p.write_text('xxx__bar=0\nxxx__nested__a=1\nxxx__nested__b=2')
+
+    class NestedSettings(BaseModel):
+        a: str = 'a'
+        b: str = 'b'
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_prefix='xxx__', env_nested_delimiter='__', env_file=p)
+
+        foo: str = ''
+        bar_alias: str = Field('', alias='xxx__bar')
+        nested_alias: NestedSettings = Field(default_factory=NestedSettings, alias='xxx__nested')
+
+    s = Settings()
+    assert s.model_dump() == {'foo': '', 'bar_alias': '0', 'nested_alias': {'a': '1', 'b': '2'}}
+
+
+def test_dotenv_with_extra_and_env_prefix(tmp_path):
+    p = tmp_path / '.env'
+    p.write_text('xxx__foo=1\nxxx__extra_var=extra_value')
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(extra='allow', env_file=p, env_prefix='xxx__')
+
+        foo: str = ''
+
+    s = Settings()
+    assert s.model_dump() == {'foo': '1', 'extra_var': 'extra_value'}
+
+
+def test_nested_field_with_alias_init_source():
+    class NestedSettings(BaseModel):
+        foo: str = Field(alias='fooAlias')
+
+    class Settings(BaseSettings):
+        nested_foo: NestedSettings
+
+    s = Settings(nested_foo=NestedSettings(fooAlias='EXAMPLE'))
+    assert s.model_dump() == {'nested_foo': {'foo': 'EXAMPLE'}}
+
+
+def test_nested_models_as_dict_value(env):
+    class NestedSettings(BaseModel):
+        foo: Dict[str, int]
+
+    class Settings(BaseSettings):
+        nested: NestedSettings
+        sub_dict: Dict[str, NestedSettings]
+
+        model_config = SettingsConfigDict(env_nested_delimiter='__')
+
+    env.set('nested__foo', '{"a": 1}')
+    env.set('sub_dict__bar__foo', '{"b": 2}')
+    s = Settings()
+    assert s.model_dump() == {'nested': {'foo': {'a': 1}}, 'sub_dict': {'bar': {'foo': {'b': 2}}}}
+
+
+def test_nested_models_leaf_vs_deeper_env_dict_assumed(env):
+    class NestedSettings(BaseModel):
+        foo: str
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_nested_delimiter='__')
+
+        nested: NestedSettings
+
+    env.set('nested__foo', 'string')
+    env.set(
+        'nested__foo__bar',
+        'this should not be evaluated, since foo is a string by annotation and not a dict',
+    )
+    env.set(
+        'nested__foo__bar__baz',
+        'one more',
+    )
+    s = Settings()
+    assert s.model_dump() == {'nested': {'foo': 'string'}}

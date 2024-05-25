@@ -2,6 +2,8 @@ from __future__ import annotations as _annotations
 
 import json
 import os
+import re
+import shlex
 import sys
 import typing
 import warnings
@@ -27,15 +29,15 @@ from typing import (
     overload,
 )
 
-import pydantic._internal._repr
-import pydantic.v1.utils
 import typing_extensions
 from dotenv import dotenv_values
 from pydantic import AliasChoices, AliasPath, BaseModel, Json
+from pydantic._internal._repr import Representation
 from pydantic._internal._typing_extra import WithArgsTypes, origin_is_union, typing_base
 from pydantic._internal._utils import deep_update, is_model_class, lenient_issubclass
+from pydantic.dataclasses import is_pydantic_dataclass
 from pydantic.fields import FieldInfo
-from typing_extensions import Annotated, get_args, get_origin
+from typing_extensions import Annotated, _AnnotatedAlias, get_args, get_origin
 
 from pydantic_settings.utils import path_type_label
 
@@ -95,6 +97,10 @@ class _CliSubCommand:
 
 
 class _CliPositionalArg:
+    pass
+
+
+class _CliInternalArgParser(ArgumentParser):
     pass
 
 
@@ -638,6 +644,8 @@ class EnvSettingsSource(PydanticBaseEnvSettingsSource):
         Returns:
             A dictionary contains extracted values from nested env values.
         """
+        is_dict = lenient_issubclass(get_origin(field.annotation), dict)
+
         prefixes = [
             f'{env_name}{self.env_nested_delimiter}' for _, env_name, _ in self._extract_field_info(field, field_name)
         ]
@@ -652,23 +660,28 @@ class EnvSettingsSource(PydanticBaseEnvSettingsSource):
             target_field: FieldInfo | None = field
             for key in keys:
                 target_field = self.next_field(target_field, key)
-                env_var = env_var.setdefault(key, {})
+                if isinstance(env_var, dict):
+                    env_var = env_var.setdefault(key, {})
 
             # get proper field with last_key
             target_field = self.next_field(target_field, last_key)
 
             # check if env_val maps to a complex field and if so, parse the env_val
-            if target_field and env_val:
-                is_complex, allow_json_failure = self._field_is_complex(target_field)
+            if (target_field or is_dict) and env_val:
+                if target_field:
+                    is_complex, allow_json_failure = self._field_is_complex(target_field)
+                else:
+                    # nested field type is dict
+                    is_complex, allow_json_failure = True, False
                 if is_complex:
                     try:
-                        env_val = self.decode_complex_value(last_key, target_field, env_val)
+                        env_val = self.decode_complex_value(last_key, target_field, env_val)  # type: ignore
                     except ValueError as e:
                         if not allow_json_failure:
                             raise e
-
-            if last_key not in env_var or not isinstance(env_val, EnvNoneType) or env_var[last_key] is {}:
-                env_var[last_key] = env_val
+            if isinstance(env_var, dict):
+                if last_key not in env_var or not isinstance(env_val, EnvNoneType) or env_var[last_key] is {}:
+                    env_var[last_key] = env_val
 
         return result
 
@@ -790,6 +803,9 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
         cli_use_class_docs_for_groups: Use class docstrings in CLI group help text instead of field descriptions.
             Defaults to `False`.
         cli_prefix: Prefix for command line arguments added under the root parser. Defaults to "".
+        case_sensitive: Whether CLI "--arg" names should be read with case-sensitivity. Defaults to `True`.
+            Note: Case-insensitive matching is only supported on the internal root parser and does not apply to CLI
+            subcommands.
         root_parser: The root parser object.
         parse_args_method: The root parser parse args method. Defaults to `argparse.ArgumentParser.parse_args`.
         add_argument_method: The root parser add argument method. Defaults to `argparse.ArgumentParser.add_argument`.
@@ -813,6 +829,7 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
         cli_enforce_required: bool | None = None,
         cli_use_class_docs_for_groups: bool | None = None,
         cli_prefix: str | None = None,
+        case_sensitive: bool | None = True,
         root_parser: Any = None,
         parse_args_method: Callable[..., Any] | None = ArgumentParser.parse_args,
         add_argument_method: Callable[..., Any] | None = ArgumentParser.add_argument,
@@ -850,16 +867,21 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                 raise SettingsError(f'CLI settings source prefix is invalid: {cli_prefix}')
             self.cli_prefix += '.'
 
+        case_sensitive = case_sensitive if case_sensitive is not None else True
+        if not case_sensitive and root_parser is not None:
+            raise SettingsError('Case-insensitive matching is only supported on the internal root parser')
+
         super().__init__(
             settings_cls,
             env_nested_delimiter='.',
             env_parse_none_str=cli_parse_none_str,
             env_parse_enums=True,
             env_prefix=self.cli_prefix,
+            case_sensitive=case_sensitive,
         )
 
         root_parser = (
-            ArgumentParser(prog=self.cli_prog_name, description=settings_cls.__doc__)
+            _CliInternalArgParser(prog=self.cli_prog_name, description=settings_cls.__doc__)
             if root_parser is None
             else root_parser
         )
@@ -985,7 +1007,10 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                 parsed_args[last_selected_subcommand] = '{}'
 
         self.env_vars = parse_env_vars(
-            parsed_args, self.case_sensitive, self.env_ignore_empty, self.env_parse_none_str  # type: ignore
+            cast(Mapping[str, str], parsed_args),
+            self.case_sensitive,
+            self.env_ignore_empty,
+            self.env_parse_none_str,
         )
 
         return self
@@ -1103,13 +1128,16 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                 raise SettingsError(f'CliSubCommand is not outermost annotation for {model.__name__}.{field_name}')
             elif _annotation_contains_types(type_, (_CliPositionalArg,), is_include_origin=False):
                 raise SettingsError(f'CliPositionalArg is not outermost annotation for {model.__name__}.{field_name}')
-            if is_model_class(type_):
-                sub_models.append(type_)
+            if is_model_class(type_) or is_pydantic_dataclass(type_):
+                sub_models.append(type_)  # type: ignore
         return sub_models
 
-    def _sort_arg_fields(self, model: type[BaseModel]) -> list[tuple[str, FieldInfo]]:
+    def _sort_arg_fields(self, model: type[BaseModel]) -> list[tuple[str, str, FieldInfo]]:
         positional_args, subcommand_args, optional_args = [], [], []
-        for field_name, field_info in model.model_fields.items():
+        fields = model.__pydantic_fields__ if is_pydantic_dataclass(model) else model.model_fields
+        for field_name, field_info in fields.items():
+            resolved_name = field_name if field_info.alias is None else field_info.alias
+            resolved_name = resolved_name.lower() if not self.case_sensitive else resolved_name
             if _CliSubCommand in field_info.metadata:
                 if not field_info.is_required():
                     raise SettingsError(f'subcommand argument {model.__name__}.{field_name} has a default value')
@@ -1119,15 +1147,15 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                         raise SettingsError(f'subcommand argument {model.__name__}.{field_name} has multiple types')
                     elif not is_model_class(field_types[0]):
                         raise SettingsError(
-                            f'subcommand argument {model.__name__}.{field_name} is not derived from BaseModel'
+                            f'subcommand argument {model.__name__}.{resolved_name} is not derived from BaseModel'
                         )
-                subcommand_args.append((field_name, field_info))
+                subcommand_args.append((field_name, resolved_name, field_info))
             elif _CliPositionalArg in field_info.metadata:
                 if not field_info.is_required():
                     raise SettingsError(f'positional argument {model.__name__}.{field_name} has a default value')
-                positional_args.append((field_name, field_info))
+                positional_args.append((field_name, resolved_name, field_info))
             else:
-                optional_args.append((field_name, field_info))
+                optional_args.append((field_name, resolved_name, field_info))
         return positional_args + subcommand_args + optional_args
 
     @property
@@ -1138,15 +1166,39 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
     def _connect_parser_method(
         self, parser_method: Callable[..., Any] | None, method_name: str, *args: Any, **kwargs: Any
     ) -> Callable[..., Any]:
-        if parser_method:
+        if (
+            parser_method is not None
+            and self.case_sensitive is False
+            and method_name == 'parsed_args_method'
+            and isinstance(self._root_parser, _CliInternalArgParser)
+        ):
+
+            def parse_args_insensitive_method(
+                root_parser: _CliInternalArgParser,
+                args: list[str] | tuple[str, ...] | None = None,
+                namespace: Namespace | None = None,
+            ) -> Any:
+                insensitive_args = []
+                for arg in shlex.split(shlex.join(args)) if args else []:
+                    matched = re.match(r'^(--[^\s=]+)(.*)', arg)
+                    if matched:
+                        arg = matched.group(1).lower() + matched.group(2)
+                    insensitive_args.append(arg)
+                return parser_method(root_parser, insensitive_args, namespace)  # type: ignore
+
+            return parse_args_insensitive_method
+
+        elif parser_method is None:
+
+            def none_parser_method(*args: Any, **kwargs: Any) -> Any:
+                raise SettingsError(
+                    f'cannot connect CLI settings source root parser: {method_name} is set to `None` but is needed for connecting'
+                )
+
+            return none_parser_method
+
+        else:
             return parser_method
-
-        def none_parser_method(*args: Any, **kwargs: Any) -> Any:
-            raise SettingsError(
-                f'cannot connect CLI settings source root parser: {method_name} is set to `None` but is needed for connecting'
-            )
-
-        return none_parser_method
 
     def _connect_root_parser(
         self,
@@ -1186,16 +1238,16 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
         group: Any,
     ) -> ArgumentParser:
         subparsers: Any = None
-        for field_name, field_info in self._sort_arg_fields(model):
+        for field_name, resolved_name, field_info in self._sort_arg_fields(model):
             sub_models: list[type[BaseModel]] = self._get_sub_models(model, field_name, field_info)
             if _CliSubCommand in field_info.metadata:
                 if subparsers is None:
                     subparsers = self._add_subparsers(
                         parser, title='subcommands', dest=f'{arg_prefix}:subcommand', required=self.cli_enforce_required
                     )
-                    self._cli_subcommands[f'{arg_prefix}:subcommand'] = [f'{arg_prefix}{field_name}']
+                    self._cli_subcommands[f'{arg_prefix}:subcommand'] = [f'{arg_prefix}{resolved_name}']
                 else:
-                    self._cli_subcommands[f'{arg_prefix}:subcommand'].append(f'{arg_prefix}{field_name}')
+                    self._cli_subcommands[f'{arg_prefix}:subcommand'].append(f'{arg_prefix}{resolved_name}')
                 if hasattr(subparsers, 'metavar'):
                     metavar = ','.join(self._cli_subcommands[f'{arg_prefix}:subcommand'])
                     subparsers.metavar = f'{{{metavar}}}'
@@ -1204,15 +1256,15 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                 self._add_parser_args(
                     parser=self._add_parser(
                         subparsers,
-                        field_name,
+                        resolved_name,
                         help=field_info.description,
                         formatter_class=self._formatter_class,
                         description=model.__doc__,
                     ),
                     model=model,
                     added_args=[],
-                    arg_prefix=f'{arg_prefix}{field_name}.',
-                    subcommand_prefix=f'{subcommand_prefix}{field_name}.',
+                    arg_prefix=f'{arg_prefix}{resolved_name}.',
+                    subcommand_prefix=f'{subcommand_prefix}{resolved_name}.',
                     group=None,
                 )
             else:
@@ -1220,7 +1272,7 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                 kwargs: dict[str, Any] = {}
                 kwargs['default'] = SUPPRESS
                 kwargs['help'] = field_info.description
-                kwargs['dest'] = f'{arg_prefix}{field_name}'
+                kwargs['dest'] = f'{arg_prefix}{resolved_name}'
                 kwargs['metavar'] = self._metavar_format(field_info.annotation)
                 kwargs['required'] = self.cli_enforce_required and field_info.is_required()
                 if kwargs['dest'] in added_args:
@@ -1233,12 +1285,12 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                         self._cli_dict_args[kwargs['dest']] = field_info.annotation
 
                 arg_name = (
-                    f'{arg_prefix}{field_name}'
+                    f'{arg_prefix}{resolved_name}'
                     if subcommand_prefix == self.env_prefix
-                    else f'{arg_prefix.replace(subcommand_prefix, "", 1)}{field_name}'
+                    else f'{arg_prefix.replace(subcommand_prefix, "", 1)}{resolved_name}'
                 )
                 if _CliPositionalArg in field_info.metadata:
-                    kwargs['metavar'] = field_name.upper()
+                    kwargs['metavar'] = resolved_name.upper()
                     arg_name = kwargs['dest']
                     del kwargs['dest']
                     del kwargs['required']
@@ -1263,7 +1315,7 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
                             parser=parser,
                             model=model,
                             added_args=added_args,
-                            arg_prefix=f'{arg_prefix}{field_name}.',
+                            arg_prefix=f'{arg_prefix}{resolved_name}.',
                             subcommand_prefix=subcommand_prefix,
                             group=model_group if model_group else model_group_kwargs,
                         )
@@ -1299,7 +1351,7 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
             return obj.__name__
         elif obj is ...:
             return '...'
-        elif isinstance(obj, (pydantic._internal._repr.Representation, pydantic.v1.utils.Representation)):
+        elif isinstance(obj, Representation):
             return repr(obj)
         elif isinstance(obj, typing_extensions.TypeAliasType):
             return str(obj)
@@ -1375,7 +1427,7 @@ class JsonConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
 
 class TomlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
     """
-    A source class that loads variables from a JSON file
+    A source class that loads variables from a TOML file
     """
 
     def __init__(
@@ -1393,6 +1445,52 @@ class TomlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
             if sys.version_info < (3, 11):
                 return tomli.load(toml_file)
             return tomllib.load(toml_file)
+
+
+class PyprojectTomlConfigSettingsSource(TomlConfigSettingsSource):
+    """
+    A source class that loads variables from a `pyproject.toml` file.
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        toml_file: Path | None = None,
+    ) -> None:
+        self.toml_file_path = self._pick_pyproject_toml_file(
+            toml_file, settings_cls.model_config.get('pyproject_toml_depth', 0)
+        )
+        self.toml_table_header: tuple[str, ...] = settings_cls.model_config.get(
+            'pyproject_toml_table_header', ('tool', 'pydantic-settings')
+        )
+        self.toml_data = self._read_files(self.toml_file_path)
+        for key in self.toml_table_header:
+            self.toml_data = self.toml_data.get(key, {})
+        super(TomlConfigSettingsSource, self).__init__(settings_cls, self.toml_data)
+
+    @staticmethod
+    def _pick_pyproject_toml_file(provided: Path | None, depth: int) -> Path:
+        """Pick a `pyproject.toml` file path to use.
+
+        Args:
+            provided: Explicit path provided when instantiating this class.
+            depth: Number of directories up the tree to check of a pyproject.toml.
+
+        """
+        if provided:
+            return provided.resolve()
+        rv = Path.cwd() / 'pyproject.toml'
+        count = 0
+        if not rv.is_file():
+            child = rv.parent.parent / 'pyproject.toml'
+            while count < depth:
+                if child.is_file():
+                    return child
+                if str(child.parent) == rv.root:
+                    break  # end discovery after checking system root once
+                child = child.parent.parent / 'pyproject.toml'
+                count += 1
+        return rv
 
 
 class YamlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
@@ -1457,6 +1555,11 @@ def read_env_file(
 def _annotation_is_complex(annotation: type[Any] | None, metadata: list[Any]) -> bool:
     if any(isinstance(md, Json) for md in metadata):  # type: ignore[misc]
         return False
+    # Check if annotation is of the form Annotated[type, metadata].
+    if isinstance(annotation, _AnnotatedAlias):
+        # Return result of recursive call on inner type.
+        inner, meta = get_args(annotation)
+        return _annotation_is_complex(inner, [meta])
     origin = get_origin(annotation)
     return (
         _annotation_is_complex_inner(annotation)

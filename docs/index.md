@@ -95,7 +95,7 @@ print(Settings().model_dump())
 3. The `AliasChoices` class allows to have multiple environment variable names for a single field.
    The first environment variable that is found will be used.
 
-    Check the [`AliasChoices`](fields.md#aliaspath-and-aliaschoices) for more information.
+    Check the [`AliasChoices`](alias.md#aliaspath-and-aliaschoices) for more information.
 
 4. The `ImportString` class allows to import an object from a string.
    In this case, the environment variable `special_function` will be read and the function `math.cos` will be imported.
@@ -458,6 +458,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 ```
 
+
+!!! note
+    Pydantic settings loads all the values from dotenv file and passes it to the model, regardless of the model's `env_prefix`.
+    So if you provide extra values in a dotenv file, whether they start with `env_prefix` or not,
+    a `ValidationError` will be raised.
+
 ## Command Line Support
 
 Pydantic settings provides integrated CLI support, making it easy to quickly define CLI applications using Pydantic
@@ -533,8 +539,43 @@ Settings(
 )
 ```
 
-Note that a CLI settings source is always [**the topmost source**](#field-value-priority) and does not support [changing
-its priority](#changing-priority).
+Note that a CLI settings source is [**the topmost source**](#field-value-priority) by default unless its [priority value
+is customised](#customise-settings-sources):
+
+```py
+import os
+import sys
+from typing import Tuple, Type
+
+from pydantic_settings import (
+    BaseSettings,
+    CliSettingsSource,
+    PydanticBaseSettingsSource,
+)
+
+
+class Settings(BaseSettings):
+    my_foo: str
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        return env_settings, CliSettingsSource(settings_cls, cli_parse_args=True)
+
+
+os.environ['MY_FOO'] = 'from environment'
+
+sys.argv = ['example.py', '--my_foo=from cli']
+
+print(Settings().model_dump())
+#> {'my_foo': 'from environment'}
+```
 
 #### Lists
 
@@ -935,11 +976,6 @@ sub_model options:
 """
 ```
 
-!!! note
-    Pydantic settings loads all the values from dotenv file and passes it to the model, regardless of the model's `env_prefix`.
-    So if you provide extra values in a dotenv file, whether they start with `env_prefix` or not,
-    a `ValidationError` will be raised.
-
 ### Integrating with Existing Parsers
 
 A CLI settings source can be integrated with existing parsers by overriding the default CLI settings source with a user
@@ -1064,9 +1100,10 @@ docker service create --name pydantic-with-secrets --secret my_secret_data pydan
 
 Other settings sources are available for common configuration files:
 
+- `JsonConfigSettingsSource` using `json_file` and `json_file_encoding` arguments
+- `PyprojectTomlConfigSettingsSource` using *(optional)* `pyproject_toml_depth` and *(optional)* `pyproject_toml_table_header` arguments
 - `TomlConfigSettingsSource` using `toml_file` argument
 - `YamlConfigSettingsSource` using `yaml_file` and yaml_file_encoding arguments
-- `JsonConfigSettingsSource` using `json_file` and `json_file_encoding` arguments
 
 You can also provide multiple files by providing a list of path:
 ```py
@@ -1115,6 +1152,127 @@ This will be able to read the following "config.toml" file, located in your work
 foobar = "Hello"
 [nested]
 nested_field = "world!"
+```
+
+### pyproject.toml
+
+"pyproject.toml" is a standardized file for providing configuration values in Python projects.
+[PEP 518](https://peps.python.org/pep-0518/#tool-table) defines a `[tool]` table that can be used to provide arbitrary tool configuration.
+While encouraged to use the `[tool]` table, `PyprojectTomlConfigSettingsSource` can be used to load variables from any location with in "pyproject.toml" file.
+
+This is controlled by providing `SettingsConfigDict(pyproject_toml_table_header=tuple[str, ...])` where the value is a tuple of header parts.
+By default, `pyproject_toml_table_header=('tool', 'pydantic-settings')` which will load variables from the `[tool.pydantic-settings]` table.
+
+```python
+from typing import Tuple, Type
+
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    PyprojectTomlConfigSettingsSource,
+    SettingsConfigDict,
+)
+
+
+class Settings(BaseSettings):
+    """Example loading values from the table used by default."""
+
+    field: str
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        return (PyprojectTomlConfigSettingsSource(settings_cls),)
+
+
+class SomeTableSettings(Settings):
+    """Example loading values from a user defined table."""
+
+    model_config = SettingsConfigDict(
+        pyproject_toml_table_header=('tool', 'some-table')
+    )
+
+
+class RootSettings(Settings):
+    """Example loading values from the root of a pyproject.toml file."""
+
+    model_config = SettingsConfigDict(extra='ignore', pyproject_toml_table_header=())
+```
+
+This will be able to read the following "pyproject.toml" file, located in your working directory, resulting in `Settings(field='default-table')`, `SomeTableSettings(field='some-table')`, & `RootSettings(field='root')`:
+
+```toml
+field = "root"
+
+[tool.pydantic-settings]
+field = "default-table"
+
+[tool.some-table]
+field = "some-table"
+```
+
+By default, `PyprojectTomlConfigSettingsSource` will only look for a "pyproject.toml" in the your current working directory.
+However, there are two options to change this behavior.
+
+* `SettingsConfigDict(pyproject_toml_depth=<int>)` can be provided to check `<int>` number of directories **up** in the directory tree for a "pyproject.toml" if one is not found in the current working directory.
+  By default, no parent directories are checked.
+* An explicit file path can be provided to the source when it is instantiated (e.g. `PyprojectTomlConfigSettingsSource(settings_cls, Path('~/.config').resolve() / 'pyproject.toml')`).
+  If a file path is provided this way, it will be treated as absolute (no other locations are checked).
+
+```python
+from pathlib import Path
+from typing import Tuple, Type
+
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    PyprojectTomlConfigSettingsSource,
+    SettingsConfigDict,
+)
+
+
+class DiscoverSettings(BaseSettings):
+    """Example of discovering a pyproject.toml in parent directories in not in `Path.cwd()`."""
+
+    model_config = SettingsConfigDict(pyproject_toml_depth=2)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        return (PyprojectTomlConfigSettingsSource(settings_cls),)
+
+
+class ExplicitFilePathSettings(BaseSettings):
+    """Example of explicitly providing the path to the file to load."""
+
+    field: str
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            PyprojectTomlConfigSettingsSource(
+                settings_cls, Path('~/.config').resolve() / 'pyproject.toml'
+            ),
+        )
 ```
 
 ## Field value priority
