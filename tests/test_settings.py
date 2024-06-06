@@ -3872,6 +3872,17 @@ def test_nested_models_as_dict_value(env):
     assert s.model_dump() == {'nested': {'foo': {'a': 1}}, 'sub_dict': {'bar': {'foo': {'b': 2}}}}
 
 
+def test_env_nested_dict_value(env):
+    class Settings(BaseSettings):
+        nested: Dict[str, Dict[str, Dict[str, str]]]
+
+        model_config = SettingsConfigDict(env_nested_delimiter='__')
+
+    env.set('nested__foo__a__b', 'bar')
+    s = Settings()
+    assert s.model_dump() == {'nested': {'foo': {'a': {'b': 'bar'}}}}
+
+
 def test_nested_models_leaf_vs_deeper_env_dict_assumed(env):
     class NestedSettings(BaseModel):
         foo: str
@@ -3892,3 +3903,19 @@ def test_nested_models_leaf_vs_deeper_env_dict_assumed(env):
     )
     s = Settings()
     assert s.model_dump() == {'nested': {'foo': 'string'}}
+
+
+def test_case_insensitive_nested_optional(env):
+    class NestedSettings(BaseModel):
+        FOO: str
+        BaR: int
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_nested_delimiter='__', case_sensitive=False)
+
+        nested: Optional[NestedSettings]
+
+    env.set('nested__FoO', 'string')
+    env.set('nested__bar', '123')
+    s = Settings()
+    assert s.model_dump() == {'nested': {'BaR': 123, 'FOO': 'string'}}

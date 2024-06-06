@@ -313,14 +313,24 @@ class PydanticBaseEnvSettingsSource(PydanticBaseSettingsSource):
         for name, value in field_values.items():
             sub_model_field: FieldInfo | None = None
 
+            annotation = field.annotation
+
+            # If field is Optional, we need to find the actual type
+            args = get_args(annotation)
+            if origin_is_union(get_origin(field.annotation)) and len(args) == 2 and type(None) in args:
+                for arg in args:
+                    if arg != type(None):
+                        annotation = arg
+                        break
+
             # This is here to make mypy happy
             # Item "None" of "Optional[Type[Any]]" has no attribute "model_fields"
-            if not field.annotation or not hasattr(field.annotation, 'model_fields'):
+            if not annotation or not hasattr(annotation, 'model_fields'):
                 values[name] = value
                 continue
 
             # Find field in sub model by looking in fields case insensitively
-            for sub_model_field_name, f in field.annotation.model_fields.items():
+            for sub_model_field_name, f in annotation.model_fields.items():
                 if not f.validation_alias and sub_model_field_name.lower() == name.lower():
                     sub_model_field = f
                     break
@@ -376,7 +386,7 @@ class PydanticBaseEnvSettingsSource(PydanticBaseSettingsSource):
                         field_value = None
                 if (
                     not self.case_sensitive
-                    and lenient_issubclass(field.annotation, BaseModel)
+                    # and lenient_issubclass(field.annotation, BaseModel)
                     and isinstance(field_value, dict)
                 ):
                     data[field_key] = self._replace_field_names_case_insensitively(field, field_value)
@@ -673,7 +683,7 @@ class EnvSettingsSource(PydanticBaseEnvSettingsSource):
                     is_complex, allow_json_failure = self._field_is_complex(target_field)
                 else:
                     # nested field type is dict
-                    is_complex, allow_json_failure = True, False
+                    is_complex, allow_json_failure = True, True
                 if is_complex:
                     try:
                         env_val = self.decode_complex_value(last_key, target_field, env_val)  # type: ignore
